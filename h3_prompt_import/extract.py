@@ -1,9 +1,15 @@
-"""Pull the Fantastic Prompt Builder's fields out of a ComfyUI-generated file.
+"""Pull the prompt out of a ComfyUI-generated file.
 
 ComfyUI writes the executed graph ("prompt") and the saved canvas
-("workflow") into every video and image it saves. The Prompt Builder keeps
-everything it knows in two widgets, `prompt_text` and `builder_state`, so
-reading those two values back is an exact copy of every field in its editor.
+("workflow") into every video and image it saves. This module finds the nodes
+in that graph that hold the prompt, whatever tool they belong to:
+
+* It starts at every text encoder (a node that returns CONDITIONING) and walks
+  back along its text inputs to the nodes where the text was typed. That can be
+  the encoder itself, a prompt builder, a string node, or a chain of them.
+* A Fantastic Prompt Builder is always included. It keeps everything it knows
+  in two widgets, `prompt_text` and `builder_state`, so reading those two
+  values back is an exact copy of every field in its editor.
 
 Nothing here touches disk: the file arrives as bytes and is parsed in memory.
 """
@@ -11,9 +17,15 @@ Nothing here touches disk: the file arrives as bytes and is parsed in memory.
 import io
 import json
 import os
+import re
 
 BUILDER = "MiniMaxH3PromptBuilder"
 IMAGE_EXT = {".png", ".webp", ".jpg", ".jpeg", ".gif", ".bmp", ".tif", ".tiff"}
+# Input names that usually hold prompt text, most likely first.
+TEXT_NAMES = ("prompt_text", "prompt", "text", "positive", "string", "value",
+              "text_g", "text_l", "t5xxl", "clip_l", "caption", "description")
+ENCODER_HINT = re.compile(r"text.?encode|prompt.?encode", re.I)
+MAX_DEPTH = 8
 
 
 def _as_dict(value):
@@ -102,11 +114,15 @@ def read_metadata(data, name):
     return {}, errors
 
 
+def _is_link(value):
+    return (isinstance(value, list) and len(value) == 2 and isinstance(value[0], (str, int))
+            and isinstance(value[1], int) and not isinstance(value[1], bool))
+
+
 def _links(value):
     """Every [node_id, slot] link inside an input value, nested ones included."""
     if isinstance(value, list):
-        if (len(value) == 2 and isinstance(value[0], (str, int))
-                and isinstance(value[1], int) and not isinstance(value[1], bool)):
+        if _is_link(value):
             yield value
         else:
             for item in value:
@@ -115,6 +131,17 @@ def _links(value):
         for item in value.values():
             yield from _links(item)
 
+
+def _scalar(value):
+    return isinstance(value, (str, int, float, bool))
+
+
+def _looks_like_json(text):
+    text = text.strip()
+    return text[:1] in ("{", "[") and text[-1:] in ("}", "]")
+
+
+# ---------------------------------------------------------------- Fantastic builder
 
 def _candidate(node_id, title, prompt_text, builder_state, origin, active):
     state = _as_dict(builder_state) if isinstance(builder_state, str) else None
@@ -191,36 +218,180 @@ def _summary(state, prompt_text):
     }
 
 
-def extract(data, name):
-    """The Prompt Builder fields held in a generated file, or why there are none."""
-    found, errors = read_metadata(data, name)
+# ---------------------------------------------------------------- any prompt tool
+
+def _roles(prompt):
+    """A function: node id -> 'positive' / 'negative' / None, by where its output ends up."""
+    consumers = {}
+    for cid, node in prompt.items():
+        if isinstance(node, dict):
+            for name, value in (node.get("inputs") or {}).items():
+                for link in _links(value):
+                    consumers.setdefault(str(link[0]), []).append((str(cid), str(name).lower()))
+
+    def role(node_id):
+        seen, frontier, hits = {str(node_id)}, [str(node_id)], set()
+        for _ in range(MAX_DEPTH):
+            following = []
+            for source in frontier:
+                for cid, name in consumers.get(source, []):
+                    if "negative" in name or name in ("neg", "uncond"):
+                        hits.add("negative")
+                    elif "positive" in name or name in ("pos", "cond"):
+                        hits.add("positive")
+                    elif cid not in seen:
+                        seen.add(cid)
+                        following.append(cid)
+            if hits or not following:
+                break
+            frontier = following
+        return "positive" if "positive" in hits else ("negative" if hits else None)
+
+    return role
+
+
+def prompt_nodes(prompt, describe=None):
+    """The nodes of an executed graph that hold prompt text, most important first.
+
+    `describe(class_type)` may return {"inputs": {name: type}, "multiline":
+    [names], "outputs": [types]} for node types installed here, or None. With
+    it the search is exact; without it, node and input names are used.
+
+    Each entry: id, type, title, role, text_field (the input holding the main
+    text) and values (what to copy into a node of the same type).
+    """
+    known = {}
+
+    def info(class_type):
+        if class_type not in known:
+            try:
+                known[class_type] = describe(class_type) if describe else None
+            except Exception:
+                known[class_type] = None
+        return known[class_type]
+
+    def is_encoder(node):
+        spec = info(node.get("class_type"))
+        if spec:
+            return "CONDITIONING" in (spec.get("outputs") or [])
+        return bool(ENCODER_HINT.search(str(node.get("class_type") or "")))
+
+    def text_inputs(node, at_encoder):
+        """(literal text fields, links to follow) of one node."""
+        spec = info(node.get("class_type"))
+        fields, links = [], []
+        for name, value in (node.get("inputs") or {}).items():
+            if spec:
+                kind = (spec.get("inputs") or {}).get(name)
+                wanted = kind == "STRING" or (kind == "*" and not at_encoder)
+            elif at_encoder:
+                wanted = str(name).lower() in TEXT_NAMES
+            else:
+                wanted = isinstance(value, str) or str(name).lower() in TEXT_NAMES
+            if not wanted:
+                continue
+            if _is_link(value):
+                links.append(value)
+            elif isinstance(value, str) and value.strip():
+                fields.append(name)
+        return fields, links
+
+    role_of = _roles(prompt)
+    found = {}   # node id -> {"fields": [...], "role": ..., "encoder": bool}
+
+    def visit(node_id, role, depth, seen):
+        node_id = str(node_id)
+        node = prompt.get(node_id)
+        if node_id in seen or not isinstance(node, dict):
+            return
+        seen.add(node_id)
+        fields, links = text_inputs(node, depth == 0)
+        if fields:
+            entry = found.setdefault(node_id, {"fields": fields, "role": role, "encoder": depth == 0})
+            if role == "positive" or entry["role"] is None:
+                entry["role"] = role or entry["role"]
+        if depth < MAX_DEPTH:
+            for link in links:
+                visit(link[0], role, depth + 1, seen)
+
+    for node_id, node in prompt.items():
+        if isinstance(node, dict) and is_encoder(node):
+            visit(node_id, role_of(node_id), 0, set())
+
+    # A filled Fantastic builder always counts, even if no encoder was traced to it.
+    for candidate in builders_from_prompt(prompt):
+        if _filled(candidate) and candidate["id"] not in found:
+            found[candidate["id"]] = {"fields": ["prompt_text"], "role": None, "encoder": False}
+
+    out = []
+    for node_id, hit in found.items():
+        node = prompt[node_id]
+        inputs = node.get("inputs") or {}
+        class_type = str(node.get("class_type") or "")
+        entry = {"id": node_id, "type": class_type, "role": hit["role"],
+                 "title": (node.get("_meta") or {}).get("title") or ""}
+        if class_type == BUILDER:
+            state = _as_dict(inputs.get("builder_state")) if isinstance(inputs.get("builder_state"), str) else None
+            if not (state and state.get("version")):
+                continue        # a builder used only to bundle media holds no prompt
+            entry["text_field"] = "prompt_text"
+            entry["summary"] = _summary(state, inputs.get("prompt_text"))
+        else:
+            multiline = set((info(class_type) or {}).get("multiline") or [])
+            plain = [f for f in hit["fields"] if not _looks_like_json(inputs[f])] or hit["fields"]
+            entry["text_field"] = min(plain, key=lambda f: (
+                f not in multiline,
+                TEXT_NAMES.index(f.lower()) if f.lower() in TEXT_NAMES else len(TEXT_NAMES),
+                -len(inputs[f])))
+        # An encoder gives up only its text. A prompt tool gives up all its settings.
+        if class_type == BUILDER:
+            names = ["prompt_text", "builder_state"]
+        elif hit["encoder"]:
+            names = hit["fields"]
+        else:
+            names = [k for k, v in inputs.items() if _scalar(v)]
+        entry["values"] = {k: inputs[k] for k in names}
+        if not isinstance(entry["values"].get(entry["text_field"]), str):
+            continue
+        out.append(entry)
+
+    # Negative prompts last; a Fantastic builder first; then what is known to be
+    # the positive prompt; then the longest text.
+    out.sort(key=lambda e: (e["role"] == "negative", e["type"] != BUILDER,
+                            e["role"] != "positive", -len(e["values"][e["text_field"]])))
+    return out
+
+
+def _nodes_from_workflow(workflow):
+    """Canvas-only files: widget values there have no names, so only the
+    Fantastic builder, whose layout is known, can be read."""
+    hits = [c for c in builders_from_workflow(workflow) if _filled(c)]
+    hits.sort(key=lambda c: (not c["active"], -len(c["prompt_text"])))
+    return [{"id": c["id"], "type": BUILDER, "role": None, "title": c["title"],
+             "text_field": "prompt_text", "summary": _summary(c["state"], c["prompt_text"]),
+             "values": {"prompt_text": c["prompt_text"], "builder_state": c["builder_state"]}}
+            for c in hits]
+
+
+def analyse(found, errors, name, describe=None):
+    """Turn a file's metadata into the list of prompt nodes, or say why not."""
     if not found:
         detail = f" ({'; '.join(errors)})" if errors else ""
         return {"ok": False, "error":
                 "This file has no ComfyUI workflow data in it. It may have been "
                 "re-encoded, edited or saved by another program." + detail}
-
-    candidates = []
-    if "prompt" in found:
-        candidates = [c for c in builders_from_prompt(found["prompt"]) if _filled(c)]
-    if not candidates and "workflow" in found:
-        candidates = [c for c in builders_from_workflow(found["workflow"]) if _filled(c)]
-    if not candidates:
+    nodes, origin = [], "prompt"
+    if isinstance(found.get("prompt"), dict):
+        nodes = prompt_nodes(found["prompt"], describe)
+    if not nodes and isinstance(found.get("workflow"), dict):
+        nodes, origin = _nodes_from_workflow(found["workflow"]), "workflow"
+    if not nodes:
         return {"ok": False, "error":
-                "This file was not made with the Fantastic Prompt Builder, so "
-                "there are no builder fields in it to copy."}
+                "This file holds a ComfyUI graph, but no prompt text was found in it."}
+    return {"ok": True, "file": os.path.basename(name or ""), "origin": origin, "nodes": nodes}
 
-    # The builder that fed the render first, then the one holding the most text.
-    candidates.sort(key=lambda c: (c["active"], len(c["prompt_text"])), reverse=True)
-    best = candidates[0]
-    return {
-        "ok": True,
-        "file": os.path.basename(name or ""),
-        "origin": best["origin"],
-        "node_id": best["id"],
-        "title": best["title"],
-        "prompt_text": best["prompt_text"],
-        "builder_state": best["builder_state"],
-        "summary": _summary(best["state"], best["prompt_text"]),
-        "others": len(candidates) - 1,
-    }
+
+def extract(data, name, describe=None):
+    """The prompt nodes held in a generated file, or why there are none."""
+    found, errors = read_metadata(data, name)
+    return analyse(found, errors, name, describe)
